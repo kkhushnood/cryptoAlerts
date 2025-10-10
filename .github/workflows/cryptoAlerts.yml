@@ -1,4 +1,4 @@
-name: crypto-alerts
+name: cryptoAlerts
 
 on:
   schedule:
