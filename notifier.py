@@ -10,13 +10,13 @@ def _clean_token(raw: str) -> str:
     return t
 
 BOT_TOKEN = "8447796045:AAFcJgKfBh1aEBmjEiqK-2IxkUaDQ7BQHws"
-CHAT_ID   = "6039469607"
+CHAT_ID   = 6039469607
 
 def notify(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
-        "text": "test hello",
+        "text": text,
         "disable_web_page_preview": True,
         "parse_mode": "HTML",
     }
