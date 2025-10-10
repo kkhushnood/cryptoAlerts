@@ -9,8 +9,8 @@ def _clean_token(raw: str) -> str:
         raise RuntimeError("TELEGRAM_BOT_TOKEN looks malformed.")
     return t
 
-BOT_TOKEN = _clean_token(os.environ["TELEGRAM_BOT_TOKEN"])
-CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+BOT_TOKEN = "8447796045:AAFcJgKfBh1aEBmjEiqK-2IxkUaDQ7BQHws"
+CHAT_ID   = "6039469607"
 
 def notify(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
