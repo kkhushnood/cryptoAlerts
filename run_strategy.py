@@ -1,68 +1,139 @@
 # -*- coding: utf-8 -*-
 """
 run_strategy.py
-Simple Binance public API price fetcher for BTCUSDT.
+Fetch BTC/USDT (or any symbol) price from Binance public API with mirror fallback.
 
-Usage (CLI):
-    python run_strategy.py
-    python run_strategy.py --symbol ETHUSDT
-    python run_strategy.py --base-url https://api.binance.us
-
-Returns (in code): Decimal price via get_symbol_price()
-
-Notes:
-- No API key required (public endpoint).
-- Uses Decimal for precision-safe arithmetic.
+Usage:
+  python run_strategy.py
+  python run_strategy.py --symbol ETHUSDT
+  python run_strategy.py --base-url https://api.binance.us
 """
 
 import argparse
 from decimal import Decimal, getcontext
+import time
+from typing import Iterable, Optional
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Set high precision for crypto prices
+# High precision for crypto prices
 getcontext().prec = 28
 
-DEFAULT_BASE_URL = "https://api.binance.com"
+# Primary + mirrors (order matters)
+BINANCE_BASE_URLS: tuple[str, ...] = (
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api-gcp.binance.com",
+    # Public data mirror (no auth needed)
+    "https://data-api.binance.vision",
+)
+
 DEFAULT_SYMBOL = "BTCUSDT"
 
 class PriceFetchError(RuntimeError):
     pass
 
-def get_symbol_price(symbol: str = DEFAULT_SYMBOL,
-                     base_url: str = DEFAULT_BASE_URL,
-                     timeout: float = 5.0) -> Decimal:
-    """
-    Binance public API se <symbol> ki current price Decimal me return karta hai.
-    Raises PriceFetchError on failure.
-    """
-    symbol = symbol.upper().strip()
+def _session_with_retries(total: int = 3, backoff: float = 0.3) -> requests.Session:
+    """Requests session with retry for transient errors."""
+    s = requests.Session()
+    retry = Retry(
+        total=total,
+        read=total,
+        connect=total,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.headers.update({
+        "Accept": "application/json",
+        # Some edge networks block requests without a UA
+        "User-Agent": "Mozilla/5.0 (compatible; price-fetcher/1.0)"
+    })
+    return s
+
+def _try_fetch_price(session: requests.Session, base_url: str, symbol: str, timeout: float) -> Optional[Decimal]:
+    """Try one base_url; return Decimal price or None on handled failure."""
     url = f"{base_url.rstrip('/')}/api/v3/ticker/price"
-    params = {"symbol": symbol}
+    try:
+        r = session.get(url, params={"symbol": symbol}, timeout=timeout)
+    except requests.RequestException:
+        return None
+
+    # Explicit handling for 451 (legal/region block)
+    if r.status_code == 451:
+        # We don't raise here; we let the caller try next mirror
+        return None
+
+    # Other non-OK codes -> maybe next mirror
+    if r.status_code != 200:
+        return None
 
     try:
-        r = requests.get(url, params=params, timeout=timeout)
-        r.raise_for_status()
         data = r.json()
-        # Expected: {"symbol":"BTCUSDT","price":"12345.67000000"}
         price_str = data.get("price")
-        if price_str is None:
-            raise PriceFetchError(f"Unexpected response payload: {data!r}")
+        if not price_str:
+            return None
         return Decimal(price_str)
-    except (requests.RequestException, ValueError) as e:
-        raise PriceFetchError(f"Failed to fetch {symbol} price from {base_url}: {e}") from e
+    except Exception:
+        return None
+
+def get_symbol_price(
+    symbol: str = DEFAULT_SYMBOL,
+    base_urls: Iterable[str] = BINANCE_BASE_URLS,
+    timeout: float = 5.0,
+    per_host_attempts: int = 2,
+) -> Decimal:
+    """
+    Binance public API se <symbol> ki current price Decimal me return karta hai.
+    Multiple mirrors try karta hai; 451/temporary errors par rotate karta hai.
+    """
+    symbol = symbol.upper().strip()
+    session = _session_with_retries()
+
+    last_errors = []
+    for base in base_urls:
+        for attempt in range(per_host_attempts):
+            price = _try_fetch_price(session, base, symbol, timeout)
+            if price is not None:
+                return price
+            # brief sleep between attempts to be polite
+            time.sleep(0.2)
+        last_errors.append(base)
+
+    # Agar yahan tak aa gaye to sab mirrors fail ho gaye
+    hint = (
+        "Server ne 451 ya network error diye ho sakte hain (region/legal restrictions). "
+        "Agar aap Binance.US use karte hain to `--base-url https://api.binance.us` try karein; "
+        "warna allowed region/Data mirror ensure karein."
+    )
+    raise PriceFetchError(
+        f"Failed to fetch {symbol} price from Binance public mirrors: {', '.join(last_errors)}. {hint}"
+    )
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch current price from Binance public API.")
-    parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Trading pair symbol, e.g., BTCUSDT")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Binance API base URL (use https://api.binance.us for Binance.US)")
-    parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout in seconds")
+    parser = argparse.ArgumentParser(description="Fetch current price from Binance public API (with mirror fallback).")
+    parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Trading pair, e.g. BTCUSDT")
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Custom Binance base URL (e.g., https://api.binance.us). If set, only this URL is used."
+    )
+    parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout seconds")
+    parser.add_argument("--attempts", type=int, default=2, help="Attempts per host before moving on")
     args = parser.parse_args()
 
     try:
-        price = get_symbol_price(args.symbol, args.base_url, args.timeout)
+        if args.base_url:
+            price = get_symbol_price(args.symbol, base_urls=(args.base_url,), timeout=args.timeout, per_host_attempts=args.attempts)
+        else:
+            price = get_symbol_price(args.symbol, timeout=args.timeout, per_host_attempts=args.attempts)
         print(f"{args.symbol}: {price}")
     except PriceFetchError as e:
-        # Clean, user-friendly error on CLI
         print(str(e))
         raise SystemExit(1)
 
