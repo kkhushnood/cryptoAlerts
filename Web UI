@@ -1,0 +1,9 @@
+name: cryptoAlerts
+on:
+  workflow_dispatch:
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "workflow_dispatch is working"
