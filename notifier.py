@@ -16,7 +16,7 @@ def notify(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
-        "text": text,
+        "text": "test hello",
         "disable_web_page_preview": True,
         "parse_mode": "HTML",
     }
