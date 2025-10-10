@@ -28,12 +28,24 @@ jobs:
         run: |
           mkdir -p out
 
+      # --- optional: debug step to confirm secrets are injected ---
+      - name: Debug token shape (masked)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          tok="${TELEGRAM_BOT_TOKEN}"
+          echo "TOKEN length: ${#tok}"
+          echo "TOKEN masked: ${tok:0:6}...${tok: -6}"
+          echo "CHAT_ID: ${TELEGRAM_CHAT_ID}"
+
       - name: Run strategy
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           BINANCE_PUBLIC_BASE: https://data-api.binance.vision
           SAVE_DIR: ./out
+          # agar Telegram ka JSON response dekhna ho to ek dafa ye enable kar sakte hain:
+          # TELEGRAM_DEBUG: "1"
         run: |
           python run_strategy.py
-
