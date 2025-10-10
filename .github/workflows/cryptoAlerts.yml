@@ -32,6 +32,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          BINANCE_PUBLIC_BASE: https://data-api.binance.vision
           SAVE_DIR: ./out
         run: |
           python run_strategy.py
