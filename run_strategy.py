@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 run_strategy.py
-Fetch BTC/USDT (or any symbol) price from Binance public API with mirror fallback.
+Fetch BTC/USDT (or any symbol) price from Binance public API with mirror fallback,
+then send it to Telegram via notifier.notify().
 
 Usage:
   python run_strategy.py
@@ -16,6 +17,9 @@ from typing import Iterable, Optional
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# >>> add this import <<<
+from notifier import notify
 
 # High precision for crypto prices
 getcontext().prec = 28
@@ -51,7 +55,6 @@ def _session_with_retries(total: int = 3, backoff: float = 0.3) -> requests.Sess
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update({
         "Accept": "application/json",
-        # Some edge networks block requests without a UA
         "User-Agent": "Mozilla/5.0 (compatible; price-fetcher/1.0)"
     })
     return s
@@ -64,12 +67,8 @@ def _try_fetch_price(session: requests.Session, base_url: str, symbol: str, time
     except requests.RequestException:
         return None
 
-    # Explicit handling for 451 (legal/region block)
     if r.status_code == 451:
-        # We don't raise here; we let the caller try next mirror
         return None
-
-    # Other non-OK codes -> maybe next mirror
     if r.status_code != 200:
         return None
 
@@ -95,24 +94,22 @@ def get_symbol_price(
     symbol = symbol.upper().strip()
     session = _session_with_retries()
 
-    last_errors = []
+    tried = []
     for base in base_urls:
-        for attempt in range(per_host_attempts):
+        for _ in range(per_host_attempts):
             price = _try_fetch_price(session, base, symbol, timeout)
             if price is not None:
                 return price
-            # brief sleep between attempts to be polite
             time.sleep(0.2)
-        last_errors.append(base)
+        tried.append(base)
 
-    # Agar yahan tak aa gaye to sab mirrors fail ho gaye
     hint = (
         "Server ne 451 ya network error diye ho sakte hain (region/legal restrictions). "
         "Agar aap Binance.US use karte hain to `--base-url https://api.binance.us` try karein; "
         "warna allowed region/Data mirror ensure karein."
     )
     raise PriceFetchError(
-        f"Failed to fetch {symbol} price from Binance public mirrors: {', '.join(last_errors)}. {hint}"
+        f"Failed to fetch {symbol} price from Binance public mirrors: {', '.join(tried)}. {hint}"
     )
 
 def main():
@@ -125,6 +122,7 @@ def main():
     )
     parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout seconds")
     parser.add_argument("--attempts", type=int, default=2, help="Attempts per host before moving on")
+    parser.add_argument("--no-notify", action="store_true", help="Only print price; do not send Telegram notification")
     args = parser.parse_args()
 
     try:
@@ -132,9 +130,23 @@ def main():
             price = get_symbol_price(args.symbol, base_urls=(args.base_url,), timeout=args.timeout, per_host_attempts=args.attempts)
         else:
             price = get_symbol_price(args.symbol, timeout=args.timeout, per_host_attempts=args.attempts)
+
+        # print to logs
         print(f"{args.symbol}: {price}")
+
+        # >>> send Telegram notification unless disabled <<<
+        if not args.no_notify:
+            # format a friendly message
+            notify(f"<b>{args.symbol}</b>: <code>{price}</code>")
+
     except PriceFetchError as e:
         print(str(e))
+        # also alert failure so you notice in Telegram (optional)
+        try:
+            if not args.no_notify:
+                notify(f"⚠️ Price fetch failed: {e}")
+        except Exception:
+            pass
         raise SystemExit(1)
 
 if __name__ == "__main__":
