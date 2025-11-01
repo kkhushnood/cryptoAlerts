@@ -18,8 +18,15 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# >>> add this import <<<
-from notifier import notify
+# --- try to import notifier.notify; if missing or broken, use a safe no-op ---
+try:
+    from notifier import notify as _notify_real  # type: ignore
+    def notify(text: str) -> None:
+        _notify_real(text)
+except Exception as _e:
+    def notify(text: str) -> None:
+        # No Telegram env / missing notifier.py — keep pipeline green
+        print(f"[notify:NOOP] {text}")
 
 # High precision for crypto prices
 getcontext().prec = 28
@@ -134,14 +141,13 @@ def main():
         # print to logs
         print(f"{args.symbol}: {price}")
 
-        # >>> send Telegram notification unless disabled <<<
+        # send Telegram notification unless disabled
         if not args.no_notify:
-            # format a friendly message
             notify(f"<b>{args.symbol}</b>: <code>{price}</code>")
 
     except PriceFetchError as e:
         print(str(e))
-        # also alert failure so you notice in Telegram (optional)
+        # also alert failure (optional)
         try:
             if not args.no_notify:
                 notify(f"⚠️ Price fetch failed: {e}")
