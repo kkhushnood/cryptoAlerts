@@ -2,417 +2,138 @@
 # -*- coding: utf-8 -*-
 
 """
-Filtered coins (Binance) — 24h % between 12–15, 24h Peak ≤ 20, and ABOVE EMA21 (latest CLOSED 1H).
-Outputs exactly these columns and also sends a Telegram message via notifier.notify():
-
-Symbol, 24h % Change, 24h % Peak, EMA TF, Prev Close, Last Close, EMA21 (Last),
-Above EMA21?, Strong Support (1H), Support Touches, Support Distance %,
-Strong Resistance (1H), Resistance Touches, Resistance Distance %
+EMA-21 filter — sends results directly to Telegram
+Filters:
+  • 24h change 12–15 %
+  • 24h peak ≤ 20 %
+  • Above EMA-21 on latest CLOSED 1H candle
+Output:
+  Telegram message (no CSV)
 
 Requirements:
   pip install requests pandas python-dateutil tabulate
-Env:
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (needed for Telegram send)
+Env vars:
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 
-import os
-import sys
-import time
-import math
-import html
-import requests
-import pandas as pd
+import os, time, math, html, requests, pandas as pd
 from datetime import datetime, timezone
 from dateutil import tz
 from typing import List, Dict, Optional, Tuple
 
-# --- Telegram notifier (must exist as in your working notifier.py) ---
+# ---------- Telegram ----------
 try:
-    from notifier import notify
-except Exception as _e:
-    def notify(text: str) -> None:
-        # Fallback so script doesn't crash if notifier missing in local tests
-        print(f"[notify:NOOP] {text}")
+    from notifier import notify  # uses your working notifier.py
+except Exception as e:
+    def notify(msg: str):
+        print("[notify:NOOP]", msg)
 
-# ---------------- Config ----------------
+def send_table_to_telegram(headers, rows, title, max_rows=25):
+    """Pretty print table and send to Telegram in chunks"""
+    from tabulate import tabulate
+    total = len(rows)
+    shown = rows[:max_rows]
+    table = tabulate(shown, headers=headers, tablefmt="plain")
+    safe = html.escape(table)
+    extra = f"\n(+{total - max_rows} more)" if total > max_rows else ""
+    notify(f"<b>{title}</b>\n<pre>{safe}{extra}</pre>")
+
+# ---------- Config ----------
 EMA_LENGTH = 21
-
-# ---- 24h filter settings ----
-MIN_24H_PCT = 12.0           # >= 12%
-MAX_24H_PCT = 15.0           # <= 15%
-MAX_24H_PEAK_PCT = 20.0      # 24h peak must NOT exceed +20%
-EMA_CHECK_INTERVAL = "1h"    # check "above EMA21" on latest CLOSED 1H candle
-
-# Limits
-MAX_COINS = 100              # top N bases by quote volume across whitelisted quotes
-CANDLES_LIMIT = 800
-
-# Stable quotes
+MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 12.0, 15.0, 20.0
+EMA_CHECK_INTERVAL = "1h"
+MAX_COINS = 100
 QUOTE_WHITELIST  = {"USDT","FDUSD","TUSD","USDC","USD"}
 QUOTE_PRIORITY   = ["USDT","FDUSD","TUSD","USDC","USD"]
-
-# Output (change if you like)
-PK_TZ = tz.gettz("Asia/Karachi")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", r"D:\Detail")
-FILTER_CSV_BASENAME = "Filtered_10to15_PeakLE20_AboveEMA21_1H"
-
-# Binance endpoints
 BASE = "https://api.binance.com"
 EP_TICKER_24H = f"{BASE}/api/v3/ticker/24hr"
-EP_KLINES     = f"{BASE}/api/v3/klines"
+EP_KLINES = f"{BASE}/api/v3/klines"
 
-# --------------- Utils ---------------
-def now_utc_ms() -> int:
-    return int(datetime.now(timezone.utc).timestamp()*1000)
-
+# ---------- Helpers ----------
 def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False, min_periods=n).mean()
 
 def to_float(x, default=None):
-    try:
-        return float(x)
-    except Exception:
-        return default
+    try: return float(x)
+    except Exception: return default
 
-def _fmt(v, nd=6):
-    try:
-        return f"{float(v):.{nd}f}"
-    except Exception:
-        return ""
-
-def make_unique_csv_path(output_dir: str, base_name: str) -> str:
-    os.makedirs(output_dir, exist_ok=True)
-    ts = datetime.now(PK_TZ).strftime("%Y-%m-%d_%H-%M-%S")
-    base = f"{base_name}_{ts}.csv"
-    path = os.path.join(output_dir, base)
-    if not os.path.exists(path):
-        return path
-    k = 1
-    while True:
-        alt = os.path.join(output_dir, f"{base_name}_{ts}_{k}.csv")
-        if not os.path.exists(alt):
-            return alt
-        k += 1
-
-def save_csv(rows: List[List], headers: List[str], base_name: str) -> str:
-    path = make_unique_csv_path(OUTPUT_DIR, base_name)
-    pd.DataFrame(rows, columns=headers).to_csv(path, index=False, encoding="utf-8-sig")
-    return path
-
-# Telegram helpers
-def _notify_chunks(title: str, body_text: str, chunk_size: int = 3800) -> None:
-    """
-    Send long text in multiple Telegram messages (HTML parse_mode).
-    Wrap body in <pre>...</pre> for monospaced table.
-    """
-    # Escape any HTML so table prints correctly
-    safe = html.escape(body_text)
-    if not safe:
-        notify(title)
-        return
-    # chunk and send
-    for i in range(0, len(safe), chunk_size):
-        part = safe[i:i+chunk_size]
-        if i == 0:
-            notify(f"<b>{title}</b>\n<pre>{part}</pre>")
-        else:
-            notify(f"<pre>{part}</pre>")
-
-def _notify_table(headers: List[str], rows: List[List], title: str, max_rows: int = 25) -> None:
-    """
-    Build a compact plain-text table and send via Telegram.
-    Limits to max_rows to avoid spamming; sends remainder count.
-    """
-    from tabulate import tabulate
-    total = len(rows)
-    show_rows = rows[:max_rows]
-    table = tabulate(show_rows, headers=headers, tablefmt="plain")
-    suffix = ""
-    if total > max_rows:
-        suffix = f"\n(+{total - max_rows} more rows)"
-    _notify_chunks(title, table + suffix)
-
-# --------------- Data fetchers ---------------
 def _split_base_quote(sym: str) -> Optional[Tuple[str,str]]:
     for q in QUOTE_PRIORITY:
-        if sym.endswith(q):
-            return sym[:-len(q)], q
+        if sym.endswith(q): return sym[:-len(q)], q
     return None
 
 def fetch_top_symbols() -> List[str]:
-    """
-    Choose at most MAX_COINS symbols by best quote per base and highest quote volume
-    over whitelisted quotes (USDⓈ).
-    """
-    r = requests.get(EP_TICKER_24H, timeout=15)
-    r.raise_for_status()
+    r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
     data = r.json()
-
-    best_for_base: Dict[str, Dict] = {}
+    best: Dict[str, Dict] = {}
     q_rank = {q:i for i,q in enumerate(QUOTE_PRIORITY)}
-
     for row in data:
-        sym = row.get("symbol","")
-        split = _split_base_quote(sym)
-        if not split:
-            continue
-        base, quote = split
+        sym = row.get("symbol",""); sp = _split_base_quote(sym)
+        if not sp: continue
+        b,q = sp
+        if b in {"USDT","BUSD","USDC","TUSD","FDUSD","DAI","UST","USTC"}: continue
+        if any(b.endswith(suf) for suf in ("UP","DOWN","BULL","BEAR")): continue
+        if q not in QUOTE_WHITELIST: continue
+        qv = to_float(row.get("quoteVolume","0"),0)
+        cur = best.get(b)
+        if not cur or q_rank[q]<q_rank[cur["quote"]] or (q==cur["quote"] and qv>cur["qv"]):
+            best[b] = {"sym":sym,"qv":qv,"quote":q}
+    return [v["sym"] for v in sorted(best.values(), key=lambda x:x["qv"], reverse=True)[:MAX_COINS]]
 
-        # skip stablecoins/indices/leveraged tokens as base
-        if base in {"USDT","BUSD","USDC","TUSD","FDUSD","DAI","UST","USTC"}:
-            continue
-        if any(base.endswith(suf) for suf in ("UP","DOWN","BULL","BEAR")):
-            continue
-        if quote not in QUOTE_WHITELIST:
-            continue
-
-        qv = to_float(row.get("quoteVolume","0"), 0.0) or 0.0
-
-        if base not in best_for_base:
-            best_for_base[base] = {"sym": sym, "qv": qv, "quote": quote}
-        else:
-            cur = best_for_base[base]
-            # prefer higher-priority quote; tie-break by higher quote volume
-            if q_rank[quote] < q_rank[cur["quote"]] or (quote == cur["quote"] and qv > cur["qv"]):
-                best_for_base[base] = {"sym": sym, "qv": qv, "quote": quote}
-
-    ranked = sorted(best_for_base.values(), key=lambda d: d["qv"], reverse=True)
-    return [d["sym"] for d in ranked[:MAX_COINS]]
-
-def fetch_24h_stats_map() -> Dict[str, Dict[str, float]]:
-    """
-    Returns: { "SYMBOL": {"cur_pct": float, "peak_pct": float} }
-      cur_pct  = (lastPrice - openPrice)/openPrice * 100
-      peak_pct = (highPrice - openPrice)/openPrice * 100
-    """
-    r = requests.get(EP_TICKER_24H, timeout=15)
-    r.raise_for_status()
-
-    out: Dict[str, Dict[str, float]] = {}
+def fetch_24h_stats() -> Dict[str,Dict[str,float]]:
+    r = requests.get(EP_TICKER_24H,timeout=15); r.raise_for_status()
+    out={}
     for row in r.json():
-        sym  = row.get("symbol","")
-        op   = to_float(row.get("openPrice","0"), 0.0) or 0.0
-        last = to_float(row.get("lastPrice","0"), 0.0) or 0.0
-        hi   = to_float(row.get("highPrice","0"), 0.0) or 0.0
-        if op <= 0:
-            continue
-        cur_pct  = (last - op) / op * 100.0
-        peak_pct = (hi   - op) / op * 100.0
-        out[sym] = {"cur_pct": cur_pct, "peak_pct": peak_pct}
+        op=to_float(row.get("openPrice",0)); la=to_float(row.get("lastPrice",0)); hi=to_float(row.get("highPrice",0))
+        if not op: continue
+        out[row["symbol"]]={"cur_pct":(la-op)/op*100,"peak_pct":(hi-op)/op*100}
     return out
 
-def fetch_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
-    r = requests.get(EP_KLINES, params={"symbol":symbol,"interval":interval,"limit":limit}, timeout=15)
-    r.raise_for_status()
-    kl = r.json()
-    if not kl:
-        return pd.DataFrame()
-
-    cols = ["open_time","open","high","low","close","volume",
-            "close_time","qv","n","tb_base","tb_quote","ignore"]
-    df = pd.DataFrame(kl, columns=cols)
-
-    # numeric conversions
-    for c in ["open","high","low","close","volume","qv","tb_base","tb_quote"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    for c in ["open_time","close_time","n"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce", downcast="integer")
-
-    # drop running candle (if any)
-    if len(df) and int(df.iloc[-1]["close_time"]) > now_utc_ms():
-        df = df.iloc[:-1].copy()
-
+def fetch_klines(sym,interval,limit=200):
+    r=requests.get(EP_KLINES,params={"symbol":sym,"interval":interval,"limit":limit},timeout=15)
+    r.raise_for_status(); kl=r.json()
+    if not kl: return pd.DataFrame()
+    cols=["open_time","open","high","low","close","volume","close_time","qv","n","tb_base","tb_quote","ignore"]
+    df=pd.DataFrame(kl,columns=cols)
+    for c in ["open","high","low","close"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+    if len(df) and int(df.iloc[-1]["close_time"])>int(datetime.now(timezone.utc).timestamp()*1000):
+        df=df.iloc[:-1]
     return df.reset_index(drop=True)
 
-# --------------- Indicators ---------------
-def atr_df(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    h, l, c1 = df["high"], df["low"], df["close"].shift(1)
-    tr = pd.concat([(h-l).abs(), (h-c1).abs(), (l-c1).abs()], axis=1).max(axis=1)
-    return tr.rolling(n, min_periods=n).mean()
+def is_above_ema21(sym,interval="1h"):
+    df=fetch_klines(sym,interval,limit=150)
+    if df.empty or len(df)<EMA_LENGTH+1: return False,None,None,None
+    e=ema(df["close"],EMA_LENGTH)
+    last=float(df["close"].iloc[-1]); ema_now=float(e.iloc[-1])
+    prev=float(df["close"].iloc[-2])
+    return last>ema_now,last,ema_now,prev
 
-# --------------- SR & EMA checks ---------------
-def _gather_pivots(df: pd.DataFrame, L: int, R: int, lookback: int = 300):
-    lows, highs = [], []
-    start = max(0, len(df) - lookback)
-
-    def is_pivot_high(i):
-        lo = max(0, i - L); hi = min(len(df), i + R + 1)
-        return df["high"].iloc[i] == df["high"].iloc[lo:hi].max()
-
-    def is_pivot_low(i):
-        lo = max(0, i - L); hi = min(len(df), i + R + 1)
-        return df["low"].iloc[i] == df["low"].iloc[lo:hi].min()
-
-    for i in range(start, len(df)):
-        if is_pivot_low(i):
-            lows.append((i, float(df["low"].iloc[i])))
-        if is_pivot_high(i):
-            highs.append((i, float(df["high"].iloc[i])))
-    return lows, highs
-
-def _cluster_levels(points, tol_abs: float):
-    if not points:
-        return []
-    pts = sorted(points, key=lambda x: x[1])
-    clusters = []
-    cur_vals, cur_indices = [], []
-
-    def push():
-        if not cur_vals:
-            return
-        clusters.append({
-            "level": sum(cur_vals)/len(cur_vals),
-            "touches": len(cur_vals),
-            "last_idx": max(cur_indices)
-        })
-
-    for idx,price in pts:
-        if not cur_vals:
-            cur_vals=[price]; cur_indices=[idx]; continue
-        mean_now = sum(cur_vals)/len(cur_vals)
-        if abs(price - mean_now) <= tol_abs:
-            cur_vals.append(price); cur_indices.append(idx)
-        else:
-            push()
-            cur_vals=[price]; cur_indices=[idx]
-    push()
-    return clusters
-
-def find_strong_sr(df: pd.DataFrame, lookback: int = 300) -> Dict[str, Optional[float]]:
-    out = {
-        "support": None, "support_touches": 0, "support_dist_pct": None,
-        "resistance": None, "resistance_touches": 0, "resistance_dist_pct": None
-    }
-    if df is None or df.empty:
-        return out
-
-    last_close = float(df["close"].iloc[-1])
-    atr = atr_df(df, 14)
-    atr_last = to_float(atr.iloc[-1], None)
-
-    # Adaptive tolerance: max(0.15% of price, 0.25 * ATR)
-    tol_abs = max(0.0015 * last_close, (0.25 * atr_last) if atr_last else 0.0)
-
-    lows, highs = _gather_pivots(df, L=2, R=2, lookback=lookback)
-    low_clusters  = _cluster_levels(lows,  tol_abs)
-    high_clusters = _cluster_levels(highs, tol_abs)
-
-    if low_clusters:
-        cands = [c for c in low_clusters if c["level"] <= last_close]
-        if cands:
-            cands.sort(key=lambda c: (c["touches"], c["level"], c["last_idx"]), reverse=True)
-            sup = cands[0]
-            out["support"] = sup["level"]
-            out["support_touches"] = sup["touches"]
-            out["support_dist_pct"] = (sup["level"] - last_close)/last_close*100.0
-
-    if high_clusters:
-        cands = [c for c in high_clusters if c["level"] >= last_close]
-        if cands:
-            cands.sort(key=lambda c: (c["touches"], -c["level"], c["last_idx"]), reverse=True)
-            res = cands[0]
-            out["resistance"] = res["level"]
-            out["resistance_touches"] = res["touches"]
-            out["resistance_dist_pct"] = (res["level"] - last_close)/last_close*100.0
-
-    return out
-
-def is_above_ema21_last_closed(symbol: str, interval: str = EMA_CHECK_INTERVAL) -> Tuple[bool, Optional[float], Optional[float], Optional[float]]:
-    """
-    Returns (ok, last_close, ema_now, prev_close)
-    ok=True only if latest CLOSED candle close > EMA21
-    """
-    df = fetch_klines(symbol, interval, limit=max(EMA_LENGTH+50, 120))
-    if df is None or df.empty or len(df) < EMA_LENGTH+1:
-        return False, None, None, None
-    e = ema(df["close"], EMA_LENGTH)
-    last_close = float(df["close"].iloc[-1])
-    ema_now = float(e.iloc[-1]) if not math.isnan(e.iloc[-1]) else None
-    if ema_now is None:
-        return False, last_close, None, None
-    return (last_close > ema_now), last_close, ema_now, float(df["close"].iloc[-2])
-
-# --------------- Main ---------------
+# ---------- main ----------
 def main():
-    headers = [
-        "Symbol","24h % Change","24h % Peak","EMA TF",
-        "Prev Close","Last Close","EMA21 (Last)","Above EMA21?",
-        "Strong Support (1H)","Support Touches","Support Distance %",
-        "Strong Resistance (1H)","Resistance Touches","Resistance Distance %"
-    ]
-
-    print(f"Selecting top {MAX_COINS} symbols from Binance (USDⓈ quotes)…")
-    top_symbols = fetch_top_symbols()
-    print(f"Top Symbols ({len(top_symbols)}):", ", ".join(top_symbols))
-
-    print(f"Fetching 24h stats and filtering for {MIN_24H_PCT}%–{MAX_24H_PCT}% "
-          f"AND peak ≤ {MAX_24H_PEAK_PCT}% …")
-    stats_map = fetch_24h_stats_map()
-
-    # first filter by 24h % & peak cap
-    candidates = []
-    for s in top_symbols:
-        st = stats_map.get(s)
-        if not st:
+    headers=["Symbol","24h %","Peak %","Prev Close","Last Close","EMA21","Above EMA21?"]
+    print("Fetching top symbols...")
+    syms=fetch_top_symbols()
+    stats=fetch_24h_stats()
+    rows=[]
+    for s in syms:
+        st=stats.get(s)
+        if not st: continue
+        if not (MIN_24H_PCT<=st["cur_pct"]<=MAX_24H_PCT and st["peak_pct"]<=MAX_24H_PEAK_PCT):
             continue
-        cur_pct  = st["cur_pct"]
-        peak_pct = st["peak_pct"]
-        if (MIN_24H_PCT <= cur_pct <= MAX_24H_PCT) and (peak_pct <= MAX_24H_PEAK_PCT):
-            candidates.append(s)
-
-    print(f"Candidates after 24h filters: {len(candidates)}")
-
-    # second filter: above EMA21 on latest CLOSED 1H; also compute SR
-    result_rows = []
-    kept = []
-    for sym in candidates:
         try:
-            ok, last_close, ema_now, prev_close = is_above_ema21_last_closed(sym, EMA_CHECK_INTERVAL)
+            ok,last,ema_now,prev=is_above_ema21(s)
             if ok:
-                df1h = fetch_klines(sym, EMA_CHECK_INTERVAL, limit=500)
-                sr = find_strong_sr(df1h, lookback=300)
-                kept.append(sym)
-                result_rows.append([
-                    sym,
-                    round(stats_map[sym]["cur_pct"], 2),          # 24h % Change (current)
-                    round(stats_map[sym]["peak_pct"], 2),         # 24h % Peak
-                    EMA_CHECK_INTERVAL.upper(),
-                    _fmt(prev_close), _fmt(last_close),
-                    _fmt(ema_now),
-                    "YES",
-                    # S/R
-                    _fmt(sr["support"]), sr["support_touches"],
-                    _fmt(sr["support_dist_pct"], nd=3),
-                    _fmt(sr["resistance"]), sr["resistance_touches"],
-                    _fmt(sr["resistance_dist_pct"], nd=3),
-                ])
-            time.sleep(0.05)  # be kind to API
+                rows.append([s,f"{st['cur_pct']:.2f}",f"{st['peak_pct']:.2f}",
+                             f"{prev:.4f}",f"{last:.4f}",f"{ema_now:.4f}","YES"])
+            time.sleep(0.05)
         except Exception as e:
-            print(f"[warn] EMA/SR check failed for {sym}: {e}", file=sys.stderr)
-
-    # output to console
-    if kept:
-        try:
-            from tabulate import tabulate
-            print("\n### Coins: 24h between 12%–15%, PEAK ≤ 20%, AND above EMA21 (1H, last closed) ###")
-            print(tabulate(result_rows, headers=headers, tablefmt="github"))
-        except Exception:
-            # fallback: simple print
-            print("\n".join([", ".join(headers)] + [", ".join(map(str, r)) for r in result_rows]))
-
-        csv_path = save_csv(result_rows, headers, FILTER_CSV_BASENAME)
-        print(f"\nFiltered CSV saved to: {csv_path}")
-
-        # ---- send to Telegram ----
-        title = "✅ Coins: 24h 12–15%, Peak ≤ 20%, Above EMA21 (1H)"
-        _notify_table(headers, result_rows, title, max_rows=25)
-        # also send a tiny footer with counts & local csv path (info only)
-        notify(f"Total matches: <b>{len(result_rows)}</b>\nCSV (local path): <code>{html.escape(csv_path)}</code>")
+            print("warn",s,e)
+    if rows:
+        title="✅ Coins 12–15 % 24h & Peak ≤ 20 & Above EMA21 (1H)"
+        send_table_to_telegram(headers,rows,title)
+        notify(f"Total matches: <b>{len(rows)}</b>")
     else:
-        msg = (f"❌ No coins matched: 24h {MIN_24H_PCT}%–{MAX_24H_PCT}%, "
-               f"peak ≤ {MAX_24H_PEAK_PCT}%, AND above EMA21 (1H).")
-        print("\n" + msg)
-        notify(msg)
+        notify(f"❌ No coins matched (24h {MIN_24H_PCT}–{MAX_24H_PCT} %, Peak ≤ {MAX_24H_PEAK_PCT} %, Above EMA21 1H)")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
