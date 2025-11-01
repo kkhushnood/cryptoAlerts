@@ -24,7 +24,7 @@ from typing import List, Dict, Optional, Tuple
 
 # ---------- Telegram ----------
 try:
-    from notifier import notify   # must be your working notifier.py
+    from notifier import notify   # uses your working notifier.py
 except Exception as e:
     def notify(msg: str):
         print("[notify:NOOP]", msg)
@@ -46,9 +46,11 @@ EMA_CHECK_INTERVAL = "1h"
 MAX_COINS = 100
 QUOTE_WHITELIST  = {"USDT","FDUSD","TUSD","USDC","USD"}
 QUOTE_PRIORITY   = ["USDT","FDUSD","TUSD","USDC","USD"]
-BASE = "https://api.binance.com"
+
+# --- FIXED 451 ERROR: Use Binance Vision mirror ---
+BASE = os.environ.get("BINANCE_BASE_URL", "https://data-api.binance.vision")
 EP_TICKER_24H = f"{BASE}/api/v3/ticker/24hr"
-EP_KLINES = f"{BASE}/api/v3/klines"
+EP_KLINES     = f"{BASE}/api/v3/klines"
 
 # ---------- Helpers ----------
 def ema(s: pd.Series, n: int) -> pd.Series:
@@ -172,7 +174,7 @@ def main():
         "Strong Support (1H)","Support Touches","Support Distance %",
         "Strong Resistance (1H)","Resistance Touches","Resistance Distance %"
     ]
-    print("Fetching top symbols...")
+    print(f"Fetching top {MAX_COINS} symbols from Binance Vision mirror...")
     syms=fetch_top_symbols()
     stats=fetch_24h_stats()
     rows=[]
