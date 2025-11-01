@@ -2,8 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-EMA21 Filter — sends table directly to Telegram (no CSV)
-Fix: uses Binance Vision mirror to avoid HTTP 451 error
+EMA21 Filter — sends final table directly to Telegram (no CSV)
+Fixes included:
+  • Uses Binance Vision mirror to avoid 451 region block
+  • Handles missing 'tabulate' automatically
+  • Sends results as formatted table to Telegram
+
+Requirements:
+  pip install requests pandas python-dateutil
 """
 
 import os, time, math, html, requests, pandas as pd
@@ -12,15 +18,22 @@ from typing import List, Dict, Optional, Tuple
 
 # ---------- Telegram ----------
 try:
-    from notifier import notify     # your working Telegram notifier.py
+    from notifier import notify     # uses your working notifier.py
 except Exception:
     def notify(msg: str):
         print("[notify:NOOP]", msg)
 
 def send_table(headers, rows, title="Filtered Results", max_rows=25):
-    """Send formatted table to Telegram"""
-    from tabulate import tabulate
-    table = tabulate(rows[:max_rows], headers=headers, tablefmt="plain")
+    """Send formatted table to Telegram (auto-fallback if tabulate not installed)"""
+    try:
+        from tabulate import tabulate
+        table = tabulate(rows[:max_rows], headers=headers, tablefmt="plain")
+    except ModuleNotFoundError:
+        # fallback simple table
+        lines = ["\t".join(headers)]
+        for row in rows[:max_rows]:
+            lines.append("\t".join(str(x) for x in row))
+        table = "\n".join(lines)
     safe = html.escape(table)
     extra = f"\n(+{len(rows)-max_rows} more)" if len(rows) > max_rows else ""
     notify(f"<b>{title}</b>\n<pre>{safe}{extra}</pre>")
@@ -33,7 +46,7 @@ MAX_COINS = 100
 QUOTE_WHITELIST = {"USDT","FDUSD","TUSD","USDC","USD"}
 QUOTE_PRIORITY  = ["USDT","FDUSD","TUSD","USDC","USD"]
 
-# ✅ FIXED BASE (mirror that works everywhere)
+# ✅ FIXED BASE (Binance Vision mirror avoids 451)
 BASE = os.environ.get("BINANCE_BASE_URL", "https://data-api.binance.vision")
 EP_TICKER_24H = f"{BASE}/api/v3/ticker/24hr"
 EP_KLINES     = f"{BASE}/api/v3/klines"
