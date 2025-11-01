@@ -3,7 +3,7 @@
 
 """
 Filtered coins (Binance) — 24h % between 12–15, 24h Peak ≤ 20, and ABOVE EMA21 (latest CLOSED 1H).
-Outputs exactly these columns:
+Outputs exactly these columns and also sends a Telegram message via notifier.notify():
 
 Symbol, 24h % Change, 24h % Peak, EMA TF, Prev Close, Last Close, EMA21 (Last),
 Above EMA21?, Strong Support (1H), Support Touches, Support Distance %,
@@ -11,17 +11,28 @@ Strong Resistance (1H), Resistance Touches, Resistance Distance %
 
 Requirements:
   pip install requests pandas python-dateutil tabulate
+Env:
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (needed for Telegram send)
 """
 
 import os
 import sys
 import time
 import math
+import html
 import requests
 import pandas as pd
 from datetime import datetime, timezone
 from dateutil import tz
 from typing import List, Dict, Optional, Tuple
+
+# --- Telegram notifier (must exist as in your working notifier.py) ---
+try:
+    from notifier import notify
+except Exception as _e:
+    def notify(text: str) -> None:
+        # Fallback so script doesn't crash if notifier missing in local tests
+        print(f"[notify:NOOP] {text}")
 
 # ---------------- Config ----------------
 EMA_LENGTH = 21
@@ -87,6 +98,39 @@ def save_csv(rows: List[List], headers: List[str], base_name: str) -> str:
     path = make_unique_csv_path(OUTPUT_DIR, base_name)
     pd.DataFrame(rows, columns=headers).to_csv(path, index=False, encoding="utf-8-sig")
     return path
+
+# Telegram helpers
+def _notify_chunks(title: str, body_text: str, chunk_size: int = 3800) -> None:
+    """
+    Send long text in multiple Telegram messages (HTML parse_mode).
+    Wrap body in <pre>...</pre> for monospaced table.
+    """
+    # Escape any HTML so table prints correctly
+    safe = html.escape(body_text)
+    if not safe:
+        notify(title)
+        return
+    # chunk and send
+    for i in range(0, len(safe), chunk_size):
+        part = safe[i:i+chunk_size]
+        if i == 0:
+            notify(f"<b>{title}</b>\n<pre>{part}</pre>")
+        else:
+            notify(f"<pre>{part}</pre>")
+
+def _notify_table(headers: List[str], rows: List[List], title: str, max_rows: int = 25) -> None:
+    """
+    Build a compact plain-text table and send via Telegram.
+    Limits to max_rows to avoid spamming; sends remainder count.
+    """
+    from tabulate import tabulate
+    total = len(rows)
+    show_rows = rows[:max_rows]
+    table = tabulate(show_rows, headers=headers, tablefmt="plain")
+    suffix = ""
+    if total > max_rows:
+        suffix = f"\n(+{total - max_rows} more rows)"
+    _notify_chunks(title, table + suffix)
 
 # --------------- Data fetchers ---------------
 def _split_base_quote(sym: str) -> Optional[Tuple[str,str]]:
@@ -346,7 +390,7 @@ def main():
         except Exception as e:
             print(f"[warn] EMA/SR check failed for {sym}: {e}", file=sys.stderr)
 
-    # output
+    # output to console
     if kept:
         try:
             from tabulate import tabulate
@@ -358,8 +402,17 @@ def main():
 
         csv_path = save_csv(result_rows, headers, FILTER_CSV_BASENAME)
         print(f"\nFiltered CSV saved to: {csv_path}")
+
+        # ---- send to Telegram ----
+        title = "✅ Coins: 24h 12–15%, Peak ≤ 20%, Above EMA21 (1H)"
+        _notify_table(headers, result_rows, title, max_rows=25)
+        # also send a tiny footer with counts & local csv path (info only)
+        notify(f"Total matches: <b>{len(result_rows)}</b>\nCSV (local path): <code>{html.escape(csv_path)}</code>")
     else:
-        print(f"\nNo coins matched: 24h {MIN_24H_PCT}%–{MAX_24H_PCT}%, peak ≤ {MAX_24H_PEAK_PCT}%, AND above EMA21 (1H).")
+        msg = (f"❌ No coins matched: 24h {MIN_24H_PCT}%–{MAX_24H_PCT}%, "
+               f"peak ≤ {MAX_24H_PEAK_PCT}%, AND above EMA21 (1H).")
+        print("\n" + msg)
+        notify(msg)
 
 if __name__ == "__main__":
     main()
