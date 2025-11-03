@@ -40,7 +40,7 @@ def send_table(headers, rows, title="Filtered Results", max_rows=25):
 
 # ---------- Config ----------
 EMA_LENGTH = 21
-MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 12.0, 15.0, 20.0
+MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 4.0, 15.0, 20.0
 EMA_CHECK_INTERVAL = "1h"
 MAX_COINS = 100
 QUOTE_WHITELIST = {"USDT","FDUSD","TUSD","USDC","USD"}
