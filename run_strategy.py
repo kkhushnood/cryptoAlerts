@@ -3,6 +3,7 @@
 
 """
 EMA21 Filter — sends final table directly to Telegram (no CSV)
+Adds: Peak Price (24h High) column in output
 Fixes included:
   • Uses Binance Vision mirror to avoid 451 region block
   • Handles missing 'tabulate' automatically
@@ -83,12 +84,22 @@ def fetch_top_symbols() -> List[str]:
     return [v["sym"] for v in sorted(best.values(),key=lambda x:x["qv"],reverse=True)[:MAX_COINS]]
 
 def fetch_24h_stats() -> Dict[str,Dict[str,float]]:
-    r=requests.get(EP_TICKER_24H,timeout=15); r.raise_for_status()
-    out={}
+    """Return cur_pct, peak_pct, and peak_price (24h high) for all symbols."""
+    r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
+    out = {}
     for row in r.json():
-        op,la,hi=to_float(row.get("openPrice")),to_float(row.get("lastPrice")),to_float(row.get("highPrice"))
-        if not op: continue
-        out[row["symbol"]]={"cur_pct":(la-op)/op*100,"peak_pct":(hi-op)/op*100}
+        op  = to_float(row.get("openPrice"))
+        la  = to_float(row.get("lastPrice"))
+        hi  = to_float(row.get("highPrice"))
+        if not op:
+            continue
+        cur_pct  = (la - op) / op * 100.0
+        peak_pct = (hi - op) / op * 100.0
+        out[row["symbol"]] = {
+            "cur_pct": cur_pct,
+            "peak_pct": peak_pct,
+            "peak_price": hi  # 24h high = price at max% up
+        }
     return out
 
 def fetch_klines(sym,interval,limit=300):
@@ -155,10 +166,12 @@ def above_ema21(sym):
 
 # ---------- Main ----------
 def main():
-    headers=["Symbol","24h % Change","24h % Peak","EMA TF",
-             "Prev Close","Last Close","EMA21 (Last)","Above EMA21?",
-             "Strong Support (1H)","Support Touches","Support Distance %",
-             "Strong Resistance (1H)","Resistance Touches","Resistance Distance %"]
+    headers=[
+        "Symbol","24h % Change","24h % Peak","Peak Price (24h High)","EMA TF",
+        "Prev Close","Last Close","EMA21 (Last)","Above EMA21?",
+        "Strong Support (1H)","Support Touches","Support Distance %",
+        "Strong Resistance (1H)","Resistance Touches","Resistance Distance %"
+    ]
 
     print(f"Fetching top {MAX_COINS} symbols from Binance Vision...")
     syms=fetch_top_symbols()
@@ -174,14 +187,23 @@ def main():
             if ok:
                 df=fetch_klines(s,"1h",500)
                 sr=strong_sr(df)
-                rows.append([s,f"{st['cur_pct']:.2f}",f"{st['peak_pct']:.2f}","1H",
-                             f"{prev:.5f}",f"{last:.5f}",f"{ema_now:.6f}","YES",
-                             f"{sr['support']:.6f}" if sr['support'] else "",
-                             sr['support_touches'],
-                             f"{sr['support_dist_pct']:.3f}" if sr['support_dist_pct'] else "",
-                             f"{sr['resistance']:.6f}" if sr['resistance'] else "",
-                             sr['resistance_touches'],
-                             f"{sr['resistance_dist_pct']:.3f}" if sr['resistance_dist_pct'] else ""])
+                rows.append([
+                    s,
+                    f"{st['cur_pct']:.2f}",
+                    f"{st['peak_pct']:.2f}",
+                    f"{st['peak_price']:.6f}",   # NEW: show 24h max% up price
+                    "1H",
+                    f"{prev:.5f}",
+                    f"{last:.5f}",
+                    f"{ema_now:.6f}",
+                    "YES",
+                    f"{sr['support']:.6f}" if sr['support'] else "",
+                    sr['support_touches'],
+                    f"{sr['support_dist_pct']:.3f}" if sr['support_dist_pct'] else "",
+                    f"{sr['resistance']:.6f}" if sr['resistance'] else "",
+                    sr['resistance_touches'],
+                    f"{sr['resistance_dist_pct']:.3f}" if sr['resistance_dist_pct'] else ""
+                ])
             time.sleep(0.05)
         except Exception as e:
             print("warn",s,e)
