@@ -33,7 +33,6 @@ def send_table(headers, rows, title="Filtered Results", max_rows=25):
         from tabulate import tabulate
         table = tabulate(rows[:max_rows], headers=headers, tablefmt="plain")
     except ModuleNotFoundError:
-        # fallback simple table
         lines = ["\t".join(headers)]
         for row in rows[:max_rows]:
             lines.append("\t".join(str(x) for x in row))
@@ -44,13 +43,12 @@ def send_table(headers, rows, title="Filtered Results", max_rows=25):
 
 # ---------- Config ----------
 EMA_LENGTH = 21
-MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 12.0, 15.0, 20.0   # current% strictly 12–15
+MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 12.0, 15.0, 20.0
 EMA_CHECK_INTERVAL = "1h"
 MAX_COINS = 100
 QUOTE_WHITELIST = {"USDT","FDUSD","TUSD","USDC","USD"}
 QUOTE_PRIORITY  = ["USDT","FDUSD","TUSD","USDC","USD"]
 
-# ✅ FIXED BASE (Binance Vision mirror avoids 451)
 BASE = os.environ.get("BINANCE_BASE_URL", "https://data-api.binance.vision")
 EP_TICKER_24H = f"{BASE}/api/v3/ticker/24hr"
 EP_KLINES     = f"{BASE}/api/v3/klines"
@@ -69,7 +67,6 @@ def _split_base_quote(sym: str) -> Optional[Tuple[str,str]]:
     return None
 
 def fetch_top_symbols() -> List[str]:
-    """Top symbols by quote volume"""
     r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
     data = r.json()
     best, qrank = {}, {q:i for i,q in enumerate(QUOTE_PRIORITY)}
@@ -87,7 +84,6 @@ def fetch_top_symbols() -> List[str]:
     return [v["sym"] for v in sorted(best.values(),key=lambda x:x["qv"],reverse=True)[:MAX_COINS]]
 
 def fetch_24h_stats() -> Dict[str,Dict[str,float]]:
-    """Return cur_pct, peak_pct, and peak_price (24h high) for all symbols."""
     r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
     out = {}
     for row in r.json():
@@ -101,7 +97,7 @@ def fetch_24h_stats() -> Dict[str,Dict[str,float]]:
         out[row["symbol"]] = {
             "cur_pct": cur_pct,
             "peak_pct": peak_pct,
-            "peak_price": hi  # 24h high = price at max% up
+            "peak_price": hi
         }
     return out
 
@@ -161,21 +157,14 @@ def strong_sr(df):
     return out
 
 def above_ema21_strict(sym):
-    """
-    STRICT EMA check for last CLOSED 1H candle:
-      - OPEN > EMA21
-      - CLOSE > EMA21
-    Returns: (ok, last_close, ema_now, prev_close)
-    """
+    """STRICT EMA check for last CLOSED 1H candle (open & close > EMA21)"""
     df=fetch_klines(sym,"1h",150)
     if df.empty or len(df)<EMA_LENGTH+1: return False,None,None,None
     e=ema(df["close"],EMA_LENGTH)
-
     last_open  = float(df["open"].iloc[-1])
     last_close = float(df["close"].iloc[-1])
     prev_close = float(df["close"].iloc[-2])
     ema_now    = float(e.iloc[-1])
-
     ok = (last_open > ema_now) and (last_close > ema_now)
     return ok, last_close, ema_now, prev_close
 
@@ -206,7 +195,7 @@ def main():
                     s,
                     f"{st['cur_pct']:.2f}",
                     f"{st['peak_pct']:.2f}",
-                    f"{st['peak_price']:.6f}",   # show 24h max% up price
+                    f"{st['peak_price']:.6f}",
                     "1H",
                     f"{prev:.5f}",
                     f"{last:.5f}",
@@ -216,7 +205,7 @@ def main():
                     sr['support_touches'],
                     f"{sr['support_dist_pct']:.3f}" if sr['support_dist_pct'] else "",
                     f"{sr['resistance']:.6f}" if sr['resistance'] else "",
-                    sr['resistance_touches"],
+                    sr['resistance_touches'],
                     f"{sr['resistance_dist_pct']:.3f}" if sr['resistance_dist_pct'] else ""
                 ])
             time.sleep(0.05)
