@@ -3,14 +3,11 @@
 
 """
 EMA21 Filter — send single-column summary to Telegram
-Style: code1-like console output + same content to Telegram when matches exist
-  • Only send Telegram message when there are matches (silent if none)
-  • STRICT EMA: last CLOSED 1H candle's OPEN & CLOSE both above EMA21
-  • Current 24h % in [12, 15], Peak ≤ 20%
-  • Strong Support & Strong Resistance via pivot clustering (1H)
-
-Requirements:
-  pip install requests pandas python-dateutil
+Improved readability:
+  • Bold coin symbol
+  • Separator lines between records
+  • Sends only when matches exist (silent if none)
+  • Includes Strong Support & Resistance (1H)
 """
 
 import os, sys, time, math, html, requests, pandas as pd
@@ -32,22 +29,17 @@ def notify_chunks(html_text: str, chunk_size: int = 3800):
 
 # ---------- Config ----------
 EMA_LENGTH = 21
-
-# 24h filter
 MIN_24H_PCT = 12.0
 MAX_24H_PCT = 15.0
 MAX_24H_PEAK_PCT = 20.0
 EMA_CHECK_INTERVAL = "1h"
-
-# Symbols universe
 MAX_COINS = 100
+
 QUOTE_WHITELIST = {"USDT","FDUSD","TUSD","USDC","USD"}
 QUOTE_PRIORITY  = ["USDT","FDUSD","TUSD","USDC","USD"]
 
-# Timezone for logs
 PK_TZ = tz.gettz("Asia/Karachi")
 
-# Binance endpoints — prefer GitHub Actions env name first
 BASE = (
     os.environ.get("BINANCE_PUBLIC_BASE") or
     os.environ.get("BINANCE_BASE_URL") or
@@ -56,11 +48,10 @@ BASE = (
 EP_TICKER_24H = f"{BASE}/api/v3/ticker/24hr"
 EP_KLINES     = f"{BASE}/api/v3/klines"
 
-# Pivot/SR settings
 PIVOT_L = 2
 PIVOT_R = 2
 
-# ---------------- Utils ----------------
+# ---------- Utils ----------
 def now_utc_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp()*1000)
 
@@ -83,7 +74,6 @@ def fetch_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in ["open_time","close_time","n"]:
         df[c] = pd.to_numeric(df[c], errors="coerce", downcast="integer")
-    # drop running candle (if any)
     if len(df) and int(df.iloc[-1]["close_time"]) > now_utc_ms():
         df = df.iloc[:-1].copy()
     return df.reset_index(drop=True)
@@ -97,7 +87,7 @@ def _split_base_quote(sym: str) -> Optional[Tuple[str,str]]:
 def fetch_top_symbols() -> List[str]:
     r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
     data = r.json()
-    best_for_base: Dict[str, Dict] = {}
+    best_for_base = {}
     q_rank = {q:i for i,q in enumerate(QUOTE_PRIORITY)}
     for row in data:
         sym = row.get("symbol","")
@@ -120,17 +110,10 @@ def fetch_top_symbols() -> List[str]:
     ranked = sorted(best_for_base.values(), key=lambda d: d["qv"], reverse=True)
     return [d["sym"] for d in ranked[:MAX_COINS]]
 
-# ---- 24h stats map (current & peak) ----
 def fetch_24h_stats_map() -> Dict[str, Dict[str, float]]:
-    """
-    Returns: { "SYMBOL": {"cur_pct": float, "peak_pct": float, "peak_price": float} }
-      cur_pct   = (lastPrice - openPrice)/openPrice * 100
-      peak_pct  = (highPrice - openPrice)/openPrice * 100
-      peak_price= highPrice
-    """
     r = requests.get(EP_TICKER_24H, timeout=15)
     r.raise_for_status()
-    out: Dict[str, Dict[str, float]] = {}
+    out = {}
     for row in r.json():
         sym = row.get("symbol","")
         try:
@@ -139,181 +122,106 @@ def fetch_24h_stats_map() -> Dict[str, Dict[str, float]]:
             hi = float(row.get("highPrice","0") or 0.0)
         except Exception:
             continue
-        if op <= 0:
-            continue
+        if op <= 0: continue
         cur_pct = (last - op) / op * 100.0
         peak_pct = (hi - op) / op * 100.0
         out[sym] = {"cur_pct": cur_pct, "peak_pct": peak_pct, "peak_price": hi}
     return out
 
-# ---- check latest CLOSED 1H candle: OPEN & CLOSE above EMA21 ----
-def is_above_ema21_last_closed(symbol: str, interval: str = EMA_CHECK_INTERVAL) -> Tuple[bool, Optional[float], Optional[float], Optional[float]]:
+def is_above_ema21_last_closed(symbol: str, interval: str = EMA_CHECK_INTERVAL):
     df = fetch_klines(symbol, interval, limit=max(EMA_LENGTH+50, 120))
     if df is None or df.empty or len(df) < EMA_LENGTH+1:
         return False, None, None, None
     e = ema(df["close"], EMA_LENGTH)
-
-    last_open  = float(df["open"].iloc[-1])
+    last_open = float(df["open"].iloc[-1])
     last_close = float(df["close"].iloc[-1])
     ema_now = float(e.iloc[-1]) if not math.isnan(e.iloc[-1]) else None
     if ema_now is None:
         return False, last_close, None, None
-
-    # Require both open & close above EMA21
     cond = (last_open > ema_now) and (last_close > ema_now)
     return cond, last_close, ema_now, float(df["close"].iloc[-2])
 
-# ---------- Strong Support & Resistance via pivot clustering ----------
-def _is_pivot_high(df: pd.DataFrame, i: int, L: int, R: int) -> bool:
-    lo = max(0, i - L); hi = min(len(df), i + R + 1)
-    return df["high"].iloc[i] == df["high"].iloc[lo:hi].max()
+# ---- SR Detection ----
+def _is_pivot_high(df, i, L, R): return df["high"].iloc[i] == df["high"].iloc[max(0,i-L):min(len(df),i+R+1)].max()
+def _is_pivot_low(df, i, L, R):  return df["low"].iloc[i]  == df["low"].iloc[max(0,i-L):min(len(df),i+R+1)].min()
 
-def _is_pivot_low(df: pd.DataFrame, i: int, L: int, R: int) -> bool:
-    lo = max(0, i - L); hi = min(len(df), i + R + 1)
-    return df["low"].iloc[i] == df["low"].iloc[lo:hi].min()
-
-def _gather_pivots(df: pd.DataFrame, L: int, R: int, lookback: int = 300):
+def _gather_pivots(df, L, R, lookback=300):
     lows, highs = [], []
-    start = max(0, len(df) - lookback)
+    start = max(0, len(df)-lookback)
     for i in range(start, len(df)):
-        if _is_pivot_low(df, i, L, R):
-            lows.append((i, float(df["low"].iloc[i])))
-        if _is_pivot_high(df, i, L, R):
-            highs.append((i, float(df["high"].iloc[i])))
+        if _is_pivot_low(df,i,L,R): lows.append((i,float(df["low"].iloc[i])))
+        if _is_pivot_high(df,i,L,R): highs.append((i,float(df["high"].iloc[i])))
     return lows, highs
 
-def _cluster_levels(points, tol_abs: float):
+def _cluster_levels(points, tol_abs):
     if not points: return []
-    pts = sorted(points, key=lambda x: x[1])
-    clusters = []
-    cur_vals, cur_idx = [], []
+    pts = sorted(points,key=lambda x:x[1])
+    clusters, curv, curi = [], [], []
     def push():
-        if not cur_vals: return
-        clusters.append({"level": sum(cur_vals)/len(cur_vals), "touches": len(cur_vals), "last_idx": max(cur_idx)})
-    for idx, price in pts:
-        if not cur_vals:
-            cur_vals, cur_idx = [price], [idx]; continue
-        if abs(price - (sum(cur_vals)/len(cur_vals))) <= tol_abs:
-            cur_vals.append(price); cur_idx.append(idx)
-        else:
-            push(); cur_vals, cur_idx = [price],[idx]
-    push()
-    return clusters
+        if curv: clusters.append({"level":sum(curv)/len(curv),"touches":len(curv),"last_idx":max(curi)})
+    for idx,price in pts:
+        if not curv: curv,curi=[price],[idx]; continue
+        if abs(price-(sum(curv)/len(curv)))<=tol_abs: curv.append(price);curi.append(idx)
+        else: push();curv,curi=[price],[idx]
+    push(); return clusters
 
-def find_strong_sr(df: pd.DataFrame, L: int = PIVOT_L, R: int = PIVOT_R, lookback: int = 300) -> Dict[str, Optional[float]]:
-    """
-    Returns dict with both support and resistance levels based on clustered pivots.
-    Picks strongest by touches; for resistance ties, prefers higher level; for support, prefers higher level (closest below) last.
-    """
-    out = {"support": None, "resistance": None}
-    if df is None or df.empty: return out
-
-    last_close = float(df["close"].iloc[-1])
-    atr = atr_df(df, 14)
-    atr_last = float(atr.iloc[-1]) if not math.isnan(atr.iloc[-1]) else None
-    tol_abs = max(0.0015 * last_close, (0.25 * atr_last) if atr_last else 0.0)
-
-    lows, highs = _gather_pivots(df, L, R, lookback=lookback)
-    low_clusters  = _cluster_levels(lows,  tol_abs)
-    high_clusters = _cluster_levels(highs, tol_abs)
-
-    if low_clusters:
-        cands = [c for c in low_clusters if c["level"] <= last_close]
-        if cands:
-            cands.sort(key=lambda c: (c["touches"], c["level"], c["last_idx"]), reverse=True)
-            out["support"] = cands[0]["level"]
-
-    if high_clusters:
-        cands = [c for c in high_clusters if c["level"] >= last_close]
-        if cands:
-            # Prefer more touches, then higher level, then recency
-            cands.sort(key=lambda c: (c["touches"], c["level"], c["last_idx"]), reverse=True)
-            out["resistance"] = cands[0]["level"]
-
+def find_strong_sr(df,L=PIVOT_L,R=PIVOT_R,lookback=300):
+    out={"support":None,"resistance":None}
+    if df.empty: return out
+    last=float(df["close"].iloc[-1])
+    atr=atr_df(df,14)
+    atr_last=float(atr.iloc[-1]) if not math.isnan(atr.iloc[-1]) else 0
+    tol_abs=max(0.0015*last,0.25*atr_last)
+    lows,highs=_gather_pivots(df,L,R,lookback)
+    low_c=_cluster_levels(lows,tol_abs)
+    high_c=_cluster_levels(highs,tol_abs)
+    if low_c:
+        c=[x for x in low_c if x["level"]<=last]
+        if c: c.sort(key=lambda x:(x["touches"],x["level"],x["last_idx"]),reverse=True); out["support"]=c[0]["level"]
+    if high_c:
+        c=[x for x in high_c if x["level"]>=last]
+        if c: c.sort(key=lambda x:(x["touches"],x["level"],x["last_idx"]),reverse=True); out["resistance"]=c[0]["level"]
     return out
 
 # ---------- Main ----------
 def main():
-    print(f"[{datetime.now(PK_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Selecting top {MAX_COINS} symbols (USDⓈ quotes)…")
-    top_symbols = fetch_top_symbols()
-    print(f"Top Symbols ({len(top_symbols)}):", ", ".join(top_symbols))
+    print(f"[{datetime.now(PK_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Selecting top {MAX_COINS} symbols…")
+    syms=fetch_top_symbols()
+    print(f"Top Symbols ({len(syms)}):", ", ".join(syms))
+    stats=fetch_24h_stats_map()
+    candidates=[s for s in syms if s in stats and MIN_24H_PCT<=stats[s]["cur_pct"]<=MAX_24H_PCT and stats[s]["peak_pct"]<=MAX_24H_PEAK_PCT]
 
-    print(f"Fetching 24h stats and filtering for {MIN_24H_PCT}%–{MAX_24H_PCT}% AND peak ≤ {MAX_24H_PEAK_PCT}% …")
-    stats_map = fetch_24h_stats_map()
-
-    # Filter 1: current 24h % in range & peak ≤ cap
-    candidates = []
-    for s in top_symbols:
-        st = stats_map.get(s)
-        if not st:
-            continue
-        cur_pct = st["cur_pct"]; peak_pct = st["peak_pct"]
-        if (MIN_24H_PCT <= cur_pct <= MAX_24H_PCT) and (peak_pct <= MAX_24H_PEAK_PCT):
-            candidates.append(s)
-
-    # Filter 2: last 1H CLOSED candle open & close above EMA21 + compute Strong Support/Resistance
-    summaries = []
+    summaries=[]
     for sym in candidates:
         try:
-            ok, last_close, ema_now, prev_close = is_above_ema21_last_closed(sym, EMA_CHECK_INTERVAL)
-            if not ok:
-                continue
-            # 1H data for SR
-            df1h = fetch_klines(sym, EMA_CHECK_INTERVAL, limit=500)
-            sr = find_strong_sr(df1h, L=PIVOT_L, R=PIVOT_R, lookback=300)
-            support = sr.get("support")
-            resistance = sr.get("resistance")
-
-            cur_pct   = stats_map[sym]["cur_pct"]
-            peak_pct  = stats_map[sym]["peak_pct"]
-            peak_price= stats_map[sym]["peak_price"]
-
-            if support is not None and resistance is not None:
-                line = (
-                    f"{sym} — Peak: {peak_pct:.2f}% | Peak Price: {peak_price:.6f} | "
-                    f"Current: {cur_pct:.2f}% | Strong Support (1H): {support:.6f} | "
-                    f"Strong Resistance (1H): {resistance:.6f}"
-                )
-            elif support is not None:
-                line = (
-                    f"{sym} — Peak: {peak_pct:.2f}% | Peak Price: {peak_price:.6f} | "
-                    f"Current: {cur_pct:.2f}% | Strong Support (1H): {support:.6f} | "
-                    f"Strong Resistance (1H): N/A"
-                )
-            elif resistance is not None:
-                line = (
-                    f"{sym} — Peak: {peak_pct:.2f}% | Peak Price: {peak_price:.6f} | "
-                    f"Current: {cur_pct:.2f}% | Strong Support (1H): N/A | "
-                    f"Strong Resistance (1H): {resistance:.6f}"
-                )
-            else:
-                line = (
-                    f"{sym} — Peak: {peak_pct:.2f}% | Peak Price: {peak_price:.6f} | "
-                    f"Current: {cur_pct:.2f}% | Strong Support (1H): N/A | "
-                    f"Strong Resistance (1H): N/A"
-                )
-
+            ok,last,ema_now,prev=is_above_ema21_last_closed(sym)
+            if not ok: continue
+            df=fetch_klines(sym,"1h",500)
+            sr=find_strong_sr(df)
+            cur,peak,price=stats[sym]["cur_pct"],stats[sym]["peak_pct"],stats[sym]["peak_price"]
+            line=(f"{sym} — Peak: {peak:.2f}% | Peak Price: {price:.6f} | Current: {cur:.2f}% | "
+                  f"Strong Support (1H): {sr['support']:.6f}" if sr["support"] else "N/A")
+            if sr["resistance"]: line += f" | Strong Resistance (1H): {sr['resistance']:.6f}"
             summaries.append(line)
             time.sleep(0.05)
         except Exception as e:
-            print(f"[warn] {sym} failed: {e}", file=sys.stderr)
+            print("[warn]",sym,e,file=sys.stderr)
 
-    # ---- Console + Telegram output (single-column like code1) ----
     if summaries:
         print("\n### Single-column results (Summary) ###")
-        for s in summaries:
-            print(s)
+        for i,s in enumerate(summaries,1):
+            print(f"{i}. {s}")
+            print("─"*90)
         print(f"\nTotal Matches: {len(summaries)}")
 
-        # Build Telegram message (HTML-safe)
-        header = "✅ EMA21 Filtered Coins (1H, O&C > EMA21)\n"
-        body   = "\n".join(summaries)
-        footer = f"\n\nTotal Matches: {len(summaries)}"
-        msg = f"<b>{header}</b><pre>{html.escape(body)}</pre>{html.escape(footer)}"
+        # Build Telegram message
+        header="✅ <b>EMA21 Filtered Coins (1H, O&C > EMA21)</b>\n"
+        body="\n\n".join([f"<b>{s.split(' — ')[0]}</b> — {html.escape(' — '.join(s.split(' — ')[1:]))}" for s in summaries])
+        footer=f"\n\nTotal Matches: {len(summaries)}"
+        msg=f"{header}<pre>{body}</pre>{html.escape(footer)}"
         notify_chunks(msg)
     else:
         print("\nNo coins matched the filters.")
-        # silent on Telegram
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
