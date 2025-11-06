@@ -8,16 +8,6 @@ Used by run_strategy.py to send messages.
 Environment variables required:
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
-
-Example (Windows PowerShell):
-  $env:TELEGRAM_BOT_TOKEN="1234567890:ABCDEF..."
-  $env:TELEGRAM_CHAT_ID="123456789"
-  python run_strategy.py
-
-Example (Linux/macOS):
-  export TELEGRAM_BOT_TOKEN=1234567890:ABCDEF...
-  export TELEGRAM_CHAT_ID=123456789
-  python3 run_strategy.py
 """
 
 import os

@@ -2,7 +2,7 @@ name: cryptoAlerts
 
 on:
   schedule:
-  - cron: "*/5 * * * *"   # har 5 minute (UTC)
+  - cron: "*/1 * * * *"   # har 5 minute (UTC)
   workflow_dispatch:        # manual run button
     inputs:
       branch:
