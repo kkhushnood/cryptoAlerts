@@ -9,18 +9,20 @@ Fixes included:
   • Handles missing 'tabulate' automatically
   • Sends results as formatted table to Telegram
 
-Updates:
-  • STRICT EMA: last CLOSED 1H candle's OPEN & CLOSE must both be above EMA21
-  • If no coins match, DO NOT send any Telegram message
+Update:
+  • EMA condition is now STRICT: last CLOSED 1H candle's OPEN & CLOSE must both be above EMA21
+
+Requirements:
+  pip install requests pandas python-dateutil
 """
 
-import os, time, html, requests, pandas as pd
+import os, time, math, html, requests, pandas as pd
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 
 # ---------- Telegram ----------
 try:
-    from notifier import notify  # uses your working notifier.py
+    from notifier import notify     # uses your working notifier.py
 except Exception:
     def notify(msg: str):
         print("[notify:NOOP]", msg)
@@ -41,13 +43,12 @@ def send_table(headers, rows, title="Filtered Results", max_rows=25):
 
 # ---------- Config ----------
 EMA_LENGTH = 21
-MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 12.0, 15.0, 20.0   # current% strictly 12–15
+MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 12.0, 15.0, 20.0
 EMA_CHECK_INTERVAL = "1h"
 MAX_COINS = 100
 QUOTE_WHITELIST = {"USDT","FDUSD","TUSD","USDC","USD"}
 QUOTE_PRIORITY  = ["USDT","FDUSD","TUSD","USDC","USD"]
 
-# Binance Vision mirror (avoids region block)
 BASE = os.environ.get("BINANCE_BASE_URL", "https://data-api.binance.vision")
 EP_TICKER_24H = f"{BASE}/api/v3/ticker/24hr"
 EP_KLINES     = f"{BASE}/api/v3/klines"
@@ -57,38 +58,32 @@ def ema(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(span=n, adjust=False, min_periods=n).mean()
 
 def to_float(x, d=None):
-    try:
-        return float(x)
-    except:
-        return d
+    try: return float(x)
+    except: return d
 
 def _split_base_quote(sym: str) -> Optional[Tuple[str,str]]:
     for q in QUOTE_PRIORITY:
-        if sym.endswith(q):
-            return sym[:-len(q)], q
+        if sym.endswith(q): return sym[:-len(q)], q
     return None
 
 def fetch_top_symbols() -> List[str]:
-    """Top symbols by quote volume (best USDⓈ quote per base)"""
     r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
     data = r.json()
     best, qrank = {}, {q:i for i,q in enumerate(QUOTE_PRIORITY)}
     for row in data:
-        sym = row.get("symbol","")
-        sp = _split_base_quote(sym)
+        sym=row["symbol"]; sp=_split_base_quote(sym)
         if not sp: continue
-        base, quote = sp
-        if base in {"USDT","BUSD","USDC","TUSD","FDUSD","DAI","UST","USTC"}: continue
-        if any(base.endswith(suf) for suf in ("UP","DOWN","BULL","BEAR")): continue
-        if quote not in QUOTE_WHITELIST: continue
-        qv = to_float(row.get("quoteVolume",0),0)
-        cur = best.get(base)
-        if (not cur) or qrank[quote] < qrank[cur["quote"]] or (quote == cur["quote"] and qv > cur["qv"]):
-            best[base] = {"sym": sym, "qv": qv, "quote": quote}
-    return [v["sym"] for v in sorted(best.values(), key=lambda x: x["qv"], reverse=True)[:MAX_COINS]]
+        b,q=sp
+        if b in {"USDT","BUSD","USDC","TUSD","FDUSD","DAI","UST","USTC"}: continue
+        if any(b.endswith(suf) for suf in ("UP","DOWN","BULL","BEAR")): continue
+        if q not in QUOTE_WHITELIST: continue
+        qv=to_float(row.get("quoteVolume",0),0)
+        cur=best.get(b)
+        if not cur or qrank[q]<qrank[cur["quote"]] or (q==cur["quote"] and qv>cur["qv"]):
+            best[b]={"sym":sym,"qv":qv,"quote":q}
+    return [v["sym"] for v in sorted(best.values(),key=lambda x:x["qv"],reverse=True)[:MAX_COINS]]
 
 def fetch_24h_stats() -> Dict[str,Dict[str,float]]:
-    """Return cur_pct, peak_pct, and peak_price (24h high) for all symbols."""
     r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
     out = {}
     for row in r.json():
@@ -99,19 +94,20 @@ def fetch_24h_stats() -> Dict[str,Dict[str,float]]:
             continue
         cur_pct  = (la - op) / op * 100.0
         peak_pct = (hi - op) / op * 100.0
-        out[row["symbol"]] = {"cur_pct": cur_pct, "peak_pct": peak_pct, "peak_price": hi}
+        out[row["symbol"]] = {
+            "cur_pct": cur_pct,
+            "peak_pct": peak_pct,
+            "peak_price": hi
+        }
     return out
 
-def fetch_klines(sym, interval, limit=300):
-    r = requests.get(EP_KLINES, params={"symbol":sym,"interval":interval,"limit":limit}, timeout=15)
+def fetch_klines(sym,interval,limit=300):
+    r=requests.get(EP_KLINES,params={"symbol":sym,"interval":interval,"limit":limit},timeout=15)
     r.raise_for_status()
-    cols = ["open_time","open","high","low","close","volume","close_time","qv","n","tb_base","tb_quote","ignore"]
-    df = pd.DataFrame(r.json(), columns=cols)
-    for c in ["open","high","low","close"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    # drop running candle (if any)
-    if len(df) and int(df.iloc[-1]["close_time"]) > int(datetime.now(timezone.utc).timestamp()*1000):
-        df = df.iloc[:-1]
+    cols=["open_time","open","high","low","close","volume","close_time","qv","n","tb_base","tb_quote","ignore"]
+    df=pd.DataFrame(r.json(),columns=cols)
+    for c in ["open","high","low","close"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+    if len(df) and int(df.iloc[-1]["close_time"])>int(datetime.now(timezone.utc).timestamp()*1000): df=df.iloc[:-1]
     return df.reset_index(drop=True)
 
 def atr(df: pd.DataFrame, n:int=14)->pd.Series:
@@ -119,25 +115,25 @@ def atr(df: pd.DataFrame, n:int=14)->pd.Series:
     tr=pd.concat([(h-l).abs(),(h-c1).abs(),(l-c1).abs()],axis=1).max(axis=1)
     return tr.rolling(n,min_periods=n).mean()
 
-def pivots(df, L=2, R=2):
-    lows, highs = [], []
-    for i in range(max(0, len(df)-300), len(df)):
-        if df["low"].iloc[i] == df["low"].iloc[max(0,i-L):min(len(df),i+R+1)].min():
-            lows.append((i, float(df["low"].iloc[i])))
-        if df["high"].iloc[i] == df["high"].iloc[max(0,i-L):min(len(df),i+R+1)].max():
-            highs.append((i, float(df["high"].iloc[i])))
-    return lows, highs
+def pivots(df,L=2,R=2):
+    lows,highs=[],[]
+    for i in range(max(0,len(df)-300),len(df)):
+        if df["low"].iloc[i]==df["low"].iloc[max(0,i-L):min(len(df),i+R+1)].min():
+            lows.append((i,float(df["low"].iloc[i])))
+        if df["high"].iloc[i]==df["high"].iloc[max(0,i-L):min(len(df),i+R+1)].max():
+            highs.append((i,float(df["high"].iloc[i])))
+    return lows,highs
 
-def cluster(points, tol):
+def cluster(points,tol):
     if not points: return []
-    pts = sorted(points, key=lambda x: x[1]); res=[]; curv=[]; curi=[]
+    pts=sorted(points,key=lambda x:x[1]);res=[];curv=[];curi=[]
     def push():
-        if curv: res.append({"lvl": sum(curv)/len(curv), "touch": len(curv), "last": max(curi)})
+        if curv: res.append({"lvl":sum(curv)/len(curv),"touch":len(curv),"last":max(curi)})
     for i,p in pts:
-        if not curv: curv=[p]; curi=[i]; continue
-        if abs(p - sum(curv)/len(curv)) <= tol: curv.append(p); curi.append(i)
-        else: push(); curv=[p]; curi=[i]
-    push(); return res
+        if not curv: curv=[p];curi=[i];continue
+        if abs(p-sum(curv)/len(curv))<=tol: curv.append(p);curi.append(i)
+        else: push();curv=[p];curi=[i]
+    push();return res
 
 def strong_sr(df):
     out={"support":None,"support_touches":0,"support_dist_pct":None,
@@ -161,7 +157,7 @@ def strong_sr(df):
     return out
 
 def above_ema21_strict(sym):
-    """STRICT EMA check for last CLOSED 1H candle (OPEN & CLOSE > EMA21)"""
+    """STRICT EMA check for last CLOSED 1H candle (open & close > EMA21)"""
     df=fetch_klines(sym,"1h",150)
     if df.empty or len(df)<EMA_LENGTH+1: return False,None,None,None
     e=ema(df["close"],EMA_LENGTH)
@@ -182,21 +178,19 @@ def main():
     ]
 
     print(f"Fetching top {MAX_COINS} symbols from Binance Vision...")
-    syms = fetch_top_symbols()
-    stats = fetch_24h_stats()
-
+    syms=fetch_top_symbols()
+    stats=fetch_24h_stats()
     rows=[]
     for s in syms:
-        st = stats.get(s)
-        if not st: 
-            continue
-        if not (MIN_24H_PCT <= st["cur_pct"] <= MAX_24H_PCT and st["peak_pct"] <= MAX_24H_PEAK_PCT):
+        st=stats.get(s)
+        if not st: continue
+        if not (MIN_24H_PCT<=st["cur_pct"]<=MAX_24H_PCT and st["peak_pct"]<=MAX_24H_PEAK_PCT):
             continue
         try:
-            ok, last, ema_now, prev = above_ema21_strict(s)
+            ok,last,ema_now,prev=above_ema21_strict(s)
             if ok:
-                df = fetch_klines(s,"1h",500)
-                sr = strong_sr(df)
+                df=fetch_klines(s,"1h",500)
+                sr=strong_sr(df)
                 rows.append([
                     s,
                     f"{st['cur_pct']:.2f}",
@@ -216,15 +210,13 @@ def main():
                 ])
             time.sleep(0.05)
         except Exception as e:
-            print("warn", s, e)
+            print("warn",s,e)
 
-    # 🔔 Only send Telegram message if we have matches
     if rows:
-        send_table(headers, rows, "✅ EMA21 Filtered Coins (1H, O&C > EMA21)")
+        send_table(headers,rows,"✅ EMA21 Filtered Coins (1H, O&C > EMA21)")
         notify(f"Total Matches: <b>{len(rows)}</b>")
     else:
-        # No notify on purpose (silent when no matches)
-        print("No matches. (silent mode)")
+        notify("❌ No coins matched filters (12–15% 24h, Peak ≤ 20%, OPEN & CLOSE above EMA21 on 1H)")
 
 if __name__=="__main__":
     main()
