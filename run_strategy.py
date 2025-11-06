@@ -9,6 +9,9 @@ Fixes included:
   • Handles missing 'tabulate' automatically
   • Sends results as formatted table to Telegram
 
+Update:
+  • EMA condition is now STRICT: last CLOSED 1H candle's OPEN & CLOSE must both be above EMA21
+
 Requirements:
   pip install requests pandas python-dateutil
 """
@@ -41,7 +44,7 @@ def send_table(headers, rows, title="Filtered Results", max_rows=25):
 
 # ---------- Config ----------
 EMA_LENGTH = 21
-MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 12.0, 15.0, 20.0
+MIN_24H_PCT, MAX_24H_PCT, MAX_24H_PEAK_PCT = 12.0, 15.0, 20.0   # current% strictly 12–15
 EMA_CHECK_INTERVAL = "1h"
 MAX_COINS = 100
 QUOTE_WHITELIST = {"USDT","FDUSD","TUSD","USDC","USD"}
@@ -128,7 +131,7 @@ def pivots(df,L=2,R=2):
 def cluster(points,tol):
     if not points: return []
     pts=sorted(points,key=lambda x:x[1]);res=[];curv=[];curi=[]
-    def push(): 
+    def push():
         if curv: res.append({"lvl":sum(curv)/len(curv),"touch":len(curv),"last":max(curi)})
     for i,p in pts:
         if not curv: curv=[p];curi=[i];continue
@@ -157,18 +160,30 @@ def strong_sr(df):
             out.update(resistance=s["lvl"],resistance_touches=s["touch"],resistance_dist_pct=(s["lvl"]-last)/last*100)
     return out
 
-def above_ema21(sym):
+def above_ema21_strict(sym):
+    """
+    STRICT EMA check for last CLOSED 1H candle:
+      - OPEN > EMA21
+      - CLOSE > EMA21
+    Returns: (ok, last_close, ema_now, prev_close)
+    """
     df=fetch_klines(sym,"1h",150)
     if df.empty or len(df)<EMA_LENGTH+1: return False,None,None,None
     e=ema(df["close"],EMA_LENGTH)
-    last,ema_now,prev=float(df["close"].iloc[-1]),float(e.iloc[-1]),float(df["close"].iloc[-2])
-    return last>ema_now,last,ema_now,prev
+
+    last_open  = float(df["open"].iloc[-1])
+    last_close = float(df["close"].iloc[-1])
+    prev_close = float(df["close"].iloc[-2])
+    ema_now    = float(e.iloc[-1])
+
+    ok = (last_open > ema_now) and (last_close > ema_now)
+    return ok, last_close, ema_now, prev_close
 
 # ---------- Main ----------
 def main():
     headers=[
         "Symbol","24h % Change","24h % Peak","Peak Price (24h High)","EMA TF",
-        "Prev Close","Last Close","EMA21 (Last)","Above EMA21?",
+        "Prev Close","Last Close","EMA21 (Last)","Open&Close > EMA21?",
         "Strong Support (1H)","Support Touches","Support Distance %",
         "Strong Resistance (1H)","Resistance Touches","Resistance Distance %"
     ]
@@ -183,7 +198,7 @@ def main():
         if not (MIN_24H_PCT<=st["cur_pct"]<=MAX_24H_PCT and st["peak_pct"]<=MAX_24H_PEAK_PCT):
             continue
         try:
-            ok,last,ema_now,prev=above_ema21(s)
+            ok,last,ema_now,prev=above_ema21_strict(s)
             if ok:
                 df=fetch_klines(s,"1h",500)
                 sr=strong_sr(df)
@@ -191,7 +206,7 @@ def main():
                     s,
                     f"{st['cur_pct']:.2f}",
                     f"{st['peak_pct']:.2f}",
-                    f"{st['peak_price']:.6f}",   # NEW: show 24h max% up price
+                    f"{st['peak_price']:.6f}",   # show 24h max% up price
                     "1H",
                     f"{prev:.5f}",
                     f"{last:.5f}",
@@ -201,7 +216,7 @@ def main():
                     sr['support_touches'],
                     f"{sr['support_dist_pct']:.3f}" if sr['support_dist_pct'] else "",
                     f"{sr['resistance']:.6f}" if sr['resistance'] else "",
-                    sr['resistance_touches'],
+                    sr['resistance_touches"],
                     f"{sr['resistance_dist_pct']:.3f}" if sr['resistance_dist_pct'] else ""
                 ])
             time.sleep(0.05)
@@ -209,10 +224,10 @@ def main():
             print("warn",s,e)
 
     if rows:
-        send_table(headers,rows,"✅ EMA21 Filtered Coins (1H)")
+        send_table(headers,rows,"✅ EMA21 Filtered Coins (1H, O&C > EMA21)")
         notify(f"Total Matches: <b>{len(rows)}</b>")
     else:
-        notify("❌ No coins matched filters (12–15 % 24h, Peak ≤ 20 %, Above EMA21 1H)")
+        notify("❌ No coins matched filters (12–15% 24h, Peak ≤ 20%, OPEN & CLOSE above EMA21 on 1H)")
 
 if __name__=="__main__":
     main()
