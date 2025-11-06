@@ -3,10 +3,14 @@
 
 """
 EMA21 Filter — sends final table directly to Telegram (no CSV)
+Adds: Peak Price (24h High) column in output
 Fixes included:
   • Uses Binance Vision mirror to avoid 451 region block
   • Handles missing 'tabulate' automatically
   • Sends results as formatted table to Telegram
+
+Update:
+  • EMA condition is now STRICT: last CLOSED 1H candle's OPEN & CLOSE must both be above EMA21
 
 Requirements:
   pip install requests pandas python-dateutil
@@ -29,7 +33,6 @@ def send_table(headers, rows, title="Filtered Results", max_rows=25):
         from tabulate import tabulate
         table = tabulate(rows[:max_rows], headers=headers, tablefmt="plain")
     except ModuleNotFoundError:
-        # fallback simple table
         lines = ["\t".join(headers)]
         for row in rows[:max_rows]:
             lines.append("\t".join(str(x) for x in row))
@@ -46,7 +49,6 @@ MAX_COINS = 100
 QUOTE_WHITELIST = {"USDT","FDUSD","TUSD","USDC","USD"}
 QUOTE_PRIORITY  = ["USDT","FDUSD","TUSD","USDC","USD"]
 
-# ✅ FIXED BASE (Binance Vision mirror avoids 451)
 BASE = os.environ.get("BINANCE_BASE_URL", "https://data-api.binance.vision")
 EP_TICKER_24H = f"{BASE}/api/v3/ticker/24hr"
 EP_KLINES     = f"{BASE}/api/v3/klines"
@@ -65,7 +67,6 @@ def _split_base_quote(sym: str) -> Optional[Tuple[str,str]]:
     return None
 
 def fetch_top_symbols() -> List[str]:
-    """Top symbols by quote volume"""
     r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
     data = r.json()
     best, qrank = {}, {q:i for i,q in enumerate(QUOTE_PRIORITY)}
@@ -83,12 +84,21 @@ def fetch_top_symbols() -> List[str]:
     return [v["sym"] for v in sorted(best.values(),key=lambda x:x["qv"],reverse=True)[:MAX_COINS]]
 
 def fetch_24h_stats() -> Dict[str,Dict[str,float]]:
-    r=requests.get(EP_TICKER_24H,timeout=15); r.raise_for_status()
-    out={}
+    r = requests.get(EP_TICKER_24H, timeout=15); r.raise_for_status()
+    out = {}
     for row in r.json():
-        op,la,hi=to_float(row.get("openPrice")),to_float(row.get("lastPrice")),to_float(row.get("highPrice"))
-        if not op: continue
-        out[row["symbol"]]={"cur_pct":(la-op)/op*100,"peak_pct":(hi-op)/op*100}
+        op  = to_float(row.get("openPrice"))
+        la  = to_float(row.get("lastPrice"))
+        hi  = to_float(row.get("highPrice"))
+        if not op:
+            continue
+        cur_pct  = (la - op) / op * 100.0
+        peak_pct = (hi - op) / op * 100.0
+        out[row["symbol"]] = {
+            "cur_pct": cur_pct,
+            "peak_pct": peak_pct,
+            "peak_price": hi
+        }
     return out
 
 def fetch_klines(sym,interval,limit=300):
@@ -117,7 +127,7 @@ def pivots(df,L=2,R=2):
 def cluster(points,tol):
     if not points: return []
     pts=sorted(points,key=lambda x:x[1]);res=[];curv=[];curi=[]
-    def push(): 
+    def push():
         if curv: res.append({"lvl":sum(curv)/len(curv),"touch":len(curv),"last":max(curi)})
     for i,p in pts:
         if not curv: curv=[p];curi=[i];continue
@@ -146,19 +156,26 @@ def strong_sr(df):
             out.update(resistance=s["lvl"],resistance_touches=s["touch"],resistance_dist_pct=(s["lvl"]-last)/last*100)
     return out
 
-def above_ema21(sym):
+def above_ema21_strict(sym):
+    """STRICT EMA check for last CLOSED 1H candle (open & close > EMA21)"""
     df=fetch_klines(sym,"1h",150)
     if df.empty or len(df)<EMA_LENGTH+1: return False,None,None,None
     e=ema(df["close"],EMA_LENGTH)
-    last,ema_now,prev=float(df["close"].iloc[-1]),float(e.iloc[-1]),float(df["close"].iloc[-2])
-    return last>ema_now,last,ema_now,prev
+    last_open  = float(df["open"].iloc[-1])
+    last_close = float(df["close"].iloc[-1])
+    prev_close = float(df["close"].iloc[-2])
+    ema_now    = float(e.iloc[-1])
+    ok = (last_open > ema_now) and (last_close > ema_now)
+    return ok, last_close, ema_now, prev_close
 
 # ---------- Main ----------
 def main():
-    headers=["Symbol","24h % Change","24h % Peak","EMA TF",
-             "Prev Close","Last Close","EMA21 (Last)","Above EMA21?",
-             "Strong Support (1H)","Support Touches","Support Distance %",
-             "Strong Resistance (1H)","Resistance Touches","Resistance Distance %"]
+    headers=[
+        "Symbol","24h % Change","24h % Peak","Peak Price (24h High)","EMA TF",
+        "Prev Close","Last Close","EMA21 (Last)","Open&Close > EMA21?",
+        "Strong Support (1H)","Support Touches","Support Distance %",
+        "Strong Resistance (1H)","Resistance Touches","Resistance Distance %"
+    ]
 
     print(f"Fetching top {MAX_COINS} symbols from Binance Vision...")
     syms=fetch_top_symbols()
@@ -170,27 +187,36 @@ def main():
         if not (MIN_24H_PCT<=st["cur_pct"]<=MAX_24H_PCT and st["peak_pct"]<=MAX_24H_PEAK_PCT):
             continue
         try:
-            ok,last,ema_now,prev=above_ema21(s)
+            ok,last,ema_now,prev=above_ema21_strict(s)
             if ok:
                 df=fetch_klines(s,"1h",500)
                 sr=strong_sr(df)
-                rows.append([s,f"{st['cur_pct']:.2f}",f"{st['peak_pct']:.2f}","1H",
-                             f"{prev:.5f}",f"{last:.5f}",f"{ema_now:.6f}","YES",
-                             f"{sr['support']:.6f}" if sr['support'] else "",
-                             sr['support_touches'],
-                             f"{sr['support_dist_pct']:.3f}" if sr['support_dist_pct'] else "",
-                             f"{sr['resistance']:.6f}" if sr['resistance'] else "",
-                             sr['resistance_touches'],
-                             f"{sr['resistance_dist_pct']:.3f}" if sr['resistance_dist_pct'] else ""])
+                rows.append([
+                    s,
+                    f"{st['cur_pct']:.2f}",
+                    f"{st['peak_pct']:.2f}",
+                    f"{st['peak_price']:.6f}",
+                    "1H",
+                    f"{prev:.5f}",
+                    f"{last:.5f}",
+                    f"{ema_now:.6f}",
+                    "YES",
+                    f"{sr['support']:.6f}" if sr['support'] else "",
+                    sr['support_touches'],
+                    f"{sr['support_dist_pct']:.3f}" if sr['support_dist_pct'] else "",
+                    f"{sr['resistance']:.6f}" if sr['resistance'] else "",
+                    sr['resistance_touches'],
+                    f"{sr['resistance_dist_pct']:.3f}" if sr['resistance_dist_pct'] else ""
+                ])
             time.sleep(0.05)
         except Exception as e:
             print("warn",s,e)
 
     if rows:
-        send_table(headers,rows,"✅ EMA21 Filtered Coins (1H)")
+        send_table(headers,rows,"✅ EMA21 Filtered Coins (1H, O&C > EMA21)")
         notify(f"Total Matches: <b>{len(rows)}</b>")
     else:
-        notify("❌ No coins matched filters (12–15 % 24h, Peak ≤ 20 %, Above EMA21 1H)")
+        notify("❌ No coins matched filters (12–15% 24h, Peak ≤ 20%, OPEN & CLOSE above EMA21 on 1H)")
 
 if __name__=="__main__":
     main()
